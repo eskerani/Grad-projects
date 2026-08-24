@@ -1,20 +1,6 @@
-SELECT 
-  COUNT(r.store_name) AS n_retailers, 
-  m.net_mig_est,
-  r.county,
-  r.state
-FROM retailers r
-JOIN migrations m 
-  ON m.county = r.county AND m.state = r.state
---WHERE r.year < 2021 AND r.year > 2015
-GROUP BY r.county, r.state, m.net_mig_est
-ORDER BY net_mig_est ASC;
-
-
-
--- NUMBER OF RETAILERS VS NET MIGRATION
-DROP VIEW retailers_migration;
-CREATE OR REPLACE VIEW retailers_migration AS
+-- Aggregating stats for all our measures across all counties
+DROP VIEW everything_view;
+CREATE OR REPLACE VIEW everything_view AS
   WITH retailers_count AS(
     SELECT 
       COUNT(r.*) AS n_retailers,
@@ -52,12 +38,18 @@ CREATE OR REPLACE VIEW retailers_migration AS
   SELECT 
     ROUND(ra.avg_n_retailers::numeric, 2) AS avg_retailers,
     ROUND((ra.avg_n_retailers / su.avg_pop * 1000)::numeric,2) AS retailers_per_1000,
-    m.net_mig_est AS net_mig_est,
+    m.net_mig_est::integer AS net_mig_est,
     ROUND(((((su.avg_pop + m.net_mig_est) - su.avg_pop) / su.avg_pop)::numeric * 100)::numeric, 2) AS pop_perc_change,
+    ROUND(AVG(su.avg_pop)::numeric, 0) AS avg_pop,
     su.avg_participation AS avg_participation,
+    ROUND((su.avg_participation * su.avg_pop)::numeric, 0) AS avg_on_snap,
     ra.acs_period AS acs_period,
     ra.state AS state,
-    ra.county AS county
+    ra.county AS county,
+    CASE 
+      WHEN ROUND(AVG(su.avg_pop)::numeric, 2) <= 50000 THEN 'Rural'
+      ELSE 'Urban'
+    END AS pop_category
   FROM retailers_agg ra
   JOIN migrations m
     ON ra.acs_period = m.acs_period 
@@ -67,21 +59,43 @@ CREATE OR REPLACE VIEW retailers_migration AS
     ON ra.acs_period = su.acs_period 
     AND ra.state = su.state
     AND ra.county = UPPER(su.county)
+  WHERE avg_participation > 0
   GROUP BY ra.state, ra.county, ra.acs_period, m.net_mig_est, ra.avg_n_retailers, su.avg_pop, su.avg_participation
   ORDER BY m.net_mig_est ASC, ra.avg_n_retailers ASC;
 
-SELECT * FROM retailers_migration;
+SELECT * FROM everything_view;
 
+-- pulling correlations using absolute numbers
+SELECT 
+  corr(avg_retailers, (avg_pop * avg_participation)) AS retailers_pov,
+  corr(avg_retailers, net_mig_est) AS retailers_mig,
+  corr(net_mig_est, (avg_pop * avg_participation)) AS mig_pov
+FROM everything_view;
+
+-- looking at urban vs rural stats for all states (across all acs periods)
+DROP VIEW v_state_agg;
+CREATE OR REPLACE VIEW v_state_agg AS
+  SELECT 
+    state,
+    pop_category,
+    round(avg(retailers_per_1000)::numeric, 2) AS avg_retailers_per_1000,
+    round(avg(pop_perc_change)::numeric, 2) AS avg_pop_perc_change,
+    round(avg(avg_pop)::numeric, 2) AS avg_pop,
+    round(avg(avg_participation)::numeric, 2) AS avg_participation,
+    round(avg(avg_on_snap)::numeric, 2) AS avg_on_snap
+  FROM everything_view
+  GROUP BY state, pop_category
+  ORDER BY state ASC;
+
+SELECT * FROM v_state_agg;
+
+-- finding correlations between all of the variables
 SELECT corr(pop_perc_change, avg_participation) AS mig_part,
     corr(pop_perc_change, retailers_per_1000) AS mig_ret
-FROM retailers_migration;
+FROM everything_view;
 
--- might need to join this to snaps after all to make it make sense
-SELECT 
-  corr(avg_retailers, net_mig_est) AS ret_mig_corr
-FROM retailers_migration;
 
--- Sorting by counties with the highest need for SNAP retailers–poverty level–and also 
+-- Sorting by counties with the highest need for SNAP retailers–poverty level and also 
 -- sorting by the counties with the lowest availability of SNAP retailers.
 CREATE OR REPLACE VIEW snap_v_pov AS
   WITH retailers_per_year AS(
@@ -100,7 +114,7 @@ CREATE OR REPLACE VIEW snap_v_pov AS
     s.county,
     s.state,
     CASE
-      WHEN AVG(s.tot_population) > 200000 THEN 'Urban'
+      WHEN AVG(s.tot_population) > 50000 THEN 'Urban'
       ELSE 'Rural'
     END AS pop_category
   FROM snaps s
@@ -109,13 +123,6 @@ CREATE OR REPLACE VIEW snap_v_pov AS
   WHERE s.participation > 0
   GROUP BY s.state, s.county
   ORDER BY avg_poor DESC, retailers_per_1000 ASC;
-
-
-select * from snap_v_pov;
-
-select
-  corr(avg_poor, avg_retailers) AS poor_retailers
-FROM snap_v_pov;
 
 
 
@@ -127,7 +134,7 @@ WITH pov_ranked AS(
     AVG(participation) AS avg_participation,
     rank() OVER(ORDER BY AVG(participation) DESC) AS county_pov_rank,
     CASE
-      WHEN AVG(tot_population) > 200000 THEN 'Urban'
+      WHEN AVG(tot_population) > 50000 THEN 'Urban'
       ELSE 'Rural'
     END AS pop_category
   FROM snaps
@@ -136,8 +143,6 @@ WITH pov_ranked AS(
 SELECT pop_category,
   COUNT(pop_category)
 FROM pov_ranked
-WHERE county_pov_rank <= 100
+WHERE avg_participation >= 0.25
 GROUP BY pop_category;
 
-
-rank() OVER(ORDER BY COUNT(y.trip_id) DESC) AS trip_rank
